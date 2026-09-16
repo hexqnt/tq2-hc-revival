@@ -128,4 +128,3 @@ fn interactive_selection_can_be_quit_without_reviving() {
     assert!(!root.join("SaveGames.tq2-hc-revival-backups").exists());
     fs::remove_dir_all(root).unwrap();
 }
-

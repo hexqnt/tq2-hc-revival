@@ -278,4 +278,3 @@ fn print_characters(characters: &[storage::Character]) {
     }
     println!("{table}");
 }
-
