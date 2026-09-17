@@ -8,7 +8,7 @@ authors = ["hexqnt <hexqntlab@gmail.com>"]
 repository = "https://github.com/hexqnt/tq2-hc-revival"
 
 [dependencies]
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 colored = "3.1"
 comfy-table = { version = "8.0", default-features = false, features = ["tty"] }
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
@@ -19,3 +19,9 @@ panic = "abort"
 opt-level = 3
 lto = true
 codegen-units = 1
+incremental = false
+
+[profile.size-analysis]
+inherits = "release"
+strip = false
+debug = 1
