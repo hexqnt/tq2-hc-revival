@@ -8,6 +8,27 @@ use std::{
 
 use crate::save;
 
+const CHARACTER_SUFFIXES: [&str; 3] = [
+    "_Header.sav",
+    "_Data_WorldFluff.sav",
+    "_Data_PlayerLocal.sav",
+];
+
+#[derive(Clone, Copy)]
+enum BackupKind {
+    Revival,
+    Restore,
+}
+
+impl BackupKind {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Revival => "",
+            Self::Restore => "-restore",
+        }
+    }
+}
+
 pub struct Character {
     pub name: String,
 
@@ -20,65 +41,150 @@ pub struct Character {
     pub details: save::HeaderDetails,
 }
 
+impl Character {
+    fn file_stem(&self) -> io::Result<&str> {
+        self.path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.strip_suffix("_Header.sav"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid character path"))
+    }
+}
+
+fn character_filenames(stem: &str) -> [String; 3] {
+    CHARACTER_SUFFIXES.map(|suffix| format!("{stem}{suffix}"))
+}
+
+pub fn inspect(
+    directory: &Path,
+    character: &Character,
+) -> io::Result<Vec<(String, Vec<save::PropertyInfo>)>> {
+    let stem = character.file_stem()?;
+    let mut files = Vec::new();
+    for (index, filename) in character_filenames(stem).into_iter().enumerate() {
+        match fs::read(directory.join(&filename)) {
+            Ok(bytes) => files.push((filename, save::inspect_properties(&bytes)?)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && index != 0 => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(files)
+}
+
+/// Restores the latest revival backup and preserves the current character files.
+pub fn restore(directory: &Path, character: &Character) -> io::Result<(PathBuf, PathBuf)> {
+    let stem = character.file_stem()?;
+    let filenames = character_filenames(stem);
+    let backup_root = backup_root(directory);
+    let mut latest = None;
+    match fs::read_dir(&backup_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir()
+                    || entry
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(BackupKind::Restore.suffix())
+                {
+                    continue;
+                }
+                let path = entry.path();
+                let header = path.join(&filenames[0]);
+                match fs::read(&header) {
+                    Ok(bytes) if save::character_name(&bytes)? == character.name => {
+                        if latest.as_ref().is_none_or(|current| path > *current) {
+                            latest = Some(path);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let source = latest.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "No revival backup found for character",
+        )
+    })?;
+    let mut files = Vec::new();
+    for (index, filename) in filenames.into_iter().enumerate() {
+        match fs::read(source.join(&filename)) {
+            Ok(bytes) => files.push((filename, bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && index != 0 => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let snapshot = create_backup_directory(directory, BackupKind::Restore)?;
+    let mut staged = Vec::new();
+    for (index, (filename, bytes)) in files.iter().enumerate() {
+        let temporary = snapshot.join(format!("restore-{index}.tmp"));
+        let mut output = File::create_new(&temporary)?;
+        output.set_permissions(fs::metadata(source.join(filename))?.permissions())?;
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        staged.push(temporary);
+    }
+    let mut replaced = Vec::new();
+    for ((filename, _), temporary) in files.iter().zip(&staged) {
+        let path = directory.join(filename);
+        let previous = snapshot.join(filename);
+        let existed = match fs::rename(&path, &previous) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                rollback_restore(&replaced);
+                return Err(error);
+            }
+        };
+        if let Err(error) = fs::rename(temporary, &path) {
+            if existed {
+                let _ = fs::rename(&previous, &path);
+            }
+            rollback_restore(&replaced);
+            return Err(error);
+        }
+        replaced.push((path, existed.then_some(previous)));
+    }
+    Ok((source, snapshot))
+}
+
+fn rollback_restore(replaced: &[(PathBuf, Option<PathBuf>)]) {
+    for (path, previous) in replaced.iter().rev() {
+        let _ = fs::remove_file(path);
+        if let Some(previous) = previous {
+            let _ = fs::rename(previous, path);
+        }
+    }
+}
+
 pub fn revive(directory: &Path, character: &Character) -> io::Result<PathBuf> {
     let mut bytes = fs::read(&character.path)?;
     let property = save::death_property(&bytes)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Character is no longer dead"))?;
     bytes.drain(property);
-    let mut edits = vec![(character.path.clone(), bytes)];
+    let backup = create_backup_directory(directory, BackupKind::Revival)?;
+    let staged = backup.join("revived-header.tmp");
+    let mut output = File::create_new(&staged)?;
+    output.set_permissions(fs::metadata(&character.path)?.permissions())?;
+    output.write_all(&bytes)?;
+    output.sync_all()?;
+    drop(output);
+
     let filename = character
         .path
         .file_name()
-        .and_then(OsStr::to_str)
-        .and_then(|name| name.strip_suffix("_Header.sav"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid character path"))?;
-    for suffix in ["_Data_WorldFluff.sav", "_Data_PlayerLocal.sav"] {
-        let path = directory.join(format!("{filename}{suffix}"));
-        match fs::read(&path) {
-            Ok(mut bytes) => {
-                if save::remove_death_stats(&mut bytes)? {
-                    edits.push((path, bytes));
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    let cleanup = cleanup_files(directory)?;
-    let backup = create_backup_directory(directory)?;
-    let mut staged = Vec::with_capacity(edits.len());
-    for (index, (path, bytes)) in edits.iter().enumerate() {
-        let temporary = backup.join(format!("revived-{index}.tmp"));
-        let mut output = File::create_new(&temporary)?;
-        output.set_permissions(fs::metadata(path)?.permissions())?;
-        output.write_all(bytes)?;
-        output.sync_all()?;
-        staged.push(temporary);
-    }
-    let mut replaced = Vec::with_capacity(edits.len());
-    for ((path, _), temporary) in edits.iter().zip(&staged) {
-        let filename = path
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid character path"))?;
-        let original = backup.join(filename);
-        if let Err(error) = fs::rename(path, &original).and_then(|()| {
-            fs::rename(temporary, path).inspect_err(|_| {
-                let _ = fs::rename(&original, path);
-            })
-        }) {
-            for (path, original) in replaced.into_iter().rev() {
-                let _ = fs::remove_file(&path);
-                let _ = fs::rename(original, path);
-            }
-            return Err(error);
-        }
-        replaced.push((path.clone(), original));
-    }
-    for file in cleanup {
-        let filename = file.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Invalid cleanup file path")
-        })?;
-        fs::rename(&file, backup.join(filename))?;
+    let original = backup.join(filename);
+    fs::rename(&character.path, &original)?;
+    if let Err(error) = fs::rename(&staged, &character.path) {
+        fs::rename(&original, &character.path)?;
+        return Err(error);
     }
     Ok(backup)
 }
@@ -104,7 +210,7 @@ pub fn characters(directory: &Path) -> io::Result<Vec<Character>> {
             count: None,
             play_seconds_at_last_death: None,
         };
-        for suffix in ["_Data_WorldFluff.sav", "_Data_PlayerLocal.sav"] {
+        for suffix in &CHARACTER_SUFFIXES[1..] {
             let companion = directory.join(format!("{stem}{suffix}"));
             match fs::read(companion) {
                 Ok(bytes) => {
@@ -130,37 +236,28 @@ pub fn characters(directory: &Path) -> io::Result<Vec<Character>> {
     Ok(characters)
 }
 
-fn cleanup_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension() == Some(OsStr::new("bak"))
-            || entry.file_name() == OsStr::new("Saving.sav")
-        {
-            paths.push(path);
-        }
-    }
-    Ok(paths)
-}
-
-fn create_backup_directory(directory: &Path) -> io::Result<PathBuf> {
+fn backup_root(directory: &Path) -> PathBuf {
     let basename = directory
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or("SaveGames");
     let parent = directory.parent().unwrap_or_else(|| Path::new("."));
-    let root = parent.join(format!("{basename}.tq2-hc-revival-backups"));
+    parent.join(format!("{basename}.tq2-hc-revival-backups"))
+}
+
+fn create_backup_directory(directory: &Path, kind: BackupKind) -> io::Result<PathBuf> {
+    let root = backup_root(directory);
     fs::create_dir_all(&root)?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_nanos();
     for attempt in 0..100 {
-        let path = root.join(format!("{timestamp}-{}-{attempt}", std::process::id()));
+        let suffix = kind.suffix();
+        let path = root.join(format!(
+            "{timestamp}-{}-{attempt}{suffix}",
+            std::process::id()
+        ));
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,

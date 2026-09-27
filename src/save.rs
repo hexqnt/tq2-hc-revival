@@ -1,5 +1,7 @@
 use std::{io, ops::Range};
 
+use time::{OffsetDateTime, macros::format_description};
+
 const NAME: &[u8] = b"\x14\0\0\0m_IsPermanentlyDead\0";
 const CHARACTER_NAME: &[u8] = b"\x10\0\0\0m_CharacterName\0";
 
@@ -17,6 +19,213 @@ pub struct HeaderDetails {
     pub play_seconds: Option<u64>,
 
     pub last_save_ticks: Option<u64>,
+}
+
+pub struct PropertyInfo {
+    pub name: String,
+    pub kind: String,
+    pub value: String,
+}
+
+/// Finds `m_` GVAS properties without assuming a fixed save layout.
+pub fn inspect_properties(bytes: &[u8]) -> io::Result<Vec<PropertyInfo>> {
+    if !bytes.starts_with(b"GVAS") {
+        return Err(invalid("Not an Unreal GVAS save"));
+    }
+    let mut properties = Vec::new();
+    for (offset, window) in bytes.windows(2).enumerate() {
+        if window != b"m_" || offset < 4 {
+            continue;
+        }
+        let start = offset - 4;
+        let Ok((name, next)) = fstring(bytes, start) else {
+            continue;
+        };
+        if !name.starts_with(b"m_") || next != offset + name.len() + 1 {
+            continue;
+        }
+        let Ok((kind, value_offset)) = fstring(bytes, next) else {
+            continue;
+        };
+        if !kind.ends_with(b"Property") {
+            continue;
+        }
+        properties.push(PropertyInfo {
+            name: String::from_utf8_lossy(name).into_owned(),
+            kind: String::from_utf8_lossy(kind).into_owned(),
+            value: inspected_value(bytes, kind, value_offset).unwrap_or_else(|| "—".to_owned()),
+        });
+    }
+    Ok(properties)
+}
+
+fn inspected_value(bytes: &[u8], kind: &[u8], offset: usize) -> Option<String> {
+    if kind == b"BoolProperty" {
+        let metadata = bytes.get(offset..offset + 9)?;
+        if metadata[..8] != [0; 8] {
+            return None;
+        }
+        return match metadata[8] {
+            0 => Some("false".to_owned()),
+            1 | 0x10 => Some("true".to_owned()),
+            _ => None,
+        };
+    }
+    if matches!(
+        kind,
+        b"EnumProperty"
+            | b"ByteProperty"
+            | b"StructProperty"
+            | b"ArrayProperty"
+            | b"SetProperty"
+            | b"MapProperty"
+    ) {
+        return inspected_typed_value(bytes, kind, offset);
+    }
+    let value = sized_value(bytes, offset, 0).ok()?;
+    match kind {
+        b"Int8Property" => Some(i8::from_le_bytes(value.try_into().ok()?).to_string()),
+        b"Int16Property" => Some(i16::from_le_bytes(value.try_into().ok()?).to_string()),
+        b"IntProperty" => Some(i32::from_le_bytes(value.try_into().ok()?).to_string()),
+        b"Int64Property" => Some(i64::from_le_bytes(value.try_into().ok()?).to_string()),
+        b"UInt8Property" => Some(u8::from_le_bytes(value.try_into().ok()?).to_string()),
+        b"UInt16Property" => Some(u16::from_le_bytes(value.try_into().ok()?).to_string()),
+        b"UInt32Property" => Some(u32::from_le_bytes(value.try_into().ok()?).to_string()),
+        b"UInt64Property" => Some(u64::from_le_bytes(value.try_into().ok()?).to_string()),
+        b"FloatProperty" => Some(f32::from_le_bytes(value.try_into().ok()?).to_string()),
+        b"DoubleProperty" => Some(f64::from_le_bytes(value.try_into().ok()?).to_string()),
+        b"StrProperty" | b"NameProperty" | b"ObjectProperty" => string_value(value).ok(),
+        b"TextProperty" => inspected_text(value)
+            .or_else(|| Some(format!("localized text ({} bytes)", value.len()))),
+        _ => None,
+    }
+}
+
+fn prefixed_string(bytes: &[u8], offset: usize) -> Option<(String, usize)> {
+    let length = i32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?);
+    if length == 0 {
+        return Some((String::new(), offset + 4));
+    }
+    let byte_length = if length < 0 {
+        (length.unsigned_abs() as usize).checked_mul(2)?
+    } else {
+        length as usize
+    };
+    let end = offset.checked_add(4)?.checked_add(byte_length)?;
+    let value = string_value(bytes.get(offset..end)?).ok()?;
+    Some((value, end))
+}
+
+fn inspected_text(value: &[u8]) -> Option<String> {
+    let history = *value.get(4)? as i8;
+    match history {
+        -1 => match value.get(5)? {
+            0 if value.len() == 6 => Some(String::new()),
+            1 => {
+                let (text, end) = prefixed_string(value, 6)?;
+                (end == value.len()).then_some(text)
+            }
+            _ => None,
+        },
+        0 => {
+            let (_, offset) = prefixed_string(value, 5)?;
+            let (_, offset) = prefixed_string(value, offset)?;
+            let (text, end) = prefixed_string(value, offset)?;
+            (end == value.len()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn type_node(bytes: &[u8], offset: usize, depth: usize) -> Option<(&[u8], usize)> {
+    if depth > 4 {
+        return None;
+    }
+    let (name, after_name) = fstring(bytes, offset).ok()?;
+    let children = u32::from_le_bytes(bytes.get(after_name..after_name + 4)?.try_into().ok()?);
+    if children > 4 {
+        return None;
+    }
+    let mut next = after_name + 4;
+    for _ in 0..children {
+        next = type_node(bytes, next, depth + 1)?.1;
+    }
+    Some((name, next))
+}
+
+fn inspected_typed_value(bytes: &[u8], kind: &[u8], offset: usize) -> Option<String> {
+    let expected_children = match kind {
+        b"EnumProperty" | b"MapProperty" => 2,
+        _ => 1,
+    };
+    let children = u32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?);
+    if children != expected_children {
+        return None;
+    }
+    let mut next = offset + 4;
+    let (inner, after_first) = type_node(bytes, next, 0)?;
+    next = after_first;
+    let mut second = None;
+    for _ in 1..children {
+        let (name, after) = type_node(bytes, next, 0)?;
+        second = Some(name);
+        next = after;
+    }
+    // The last type node's zero child count precedes the value size and tag flags.
+    let value_offset = next.checked_sub(4)?;
+    let value = if kind == b"StructProperty" {
+        sized_value(bytes, value_offset, 8)
+            .or_else(|_| sized_value(bytes, value_offset, 0))
+            .ok()?
+    } else {
+        sized_value(bytes, value_offset, 0).ok()?
+    };
+    let inner = std::str::from_utf8(inner).ok()?;
+    let second = second.map(std::str::from_utf8).transpose().ok()?;
+    match kind {
+        b"EnumProperty" => {
+            let (name, end) = fstring(value, 0).ok()?;
+            (end == value.len()).then(|| {
+                String::from_utf8_lossy(name.rsplit(|byte| *byte == b':').next().unwrap_or(name))
+                    .into_owned()
+            })
+        }
+        b"ByteProperty" => match value {
+            [byte] => Some(byte.to_string()),
+            _ => {
+                let (name, end) = fstring(value, 0).ok()?;
+                (end == value.len()).then(|| String::from_utf8_lossy(name).into_owned())
+            }
+        },
+        b"StructProperty" if inner == "DateTime" => {
+            let ticks = u64::from_le_bytes(value.try_into().ok()?);
+            const UNIX_EPOCH_TICKS: i128 = 621_355_968_000_000_000;
+            OffsetDateTime::from_unix_timestamp_nanos((i128::from(ticks) - UNIX_EPOCH_TICKS) * 100)
+                .ok()?
+                .format(&format_description!(
+                    "[year]-[month]-[day] [hour]:[minute]:[second] UTC"
+                ))
+                .ok()
+        }
+        b"StructProperty" => Some(format!("{inner} ({} bytes)", value.len())),
+        b"ArrayProperty" => {
+            let count = u32::from_le_bytes(value.get(..4)?.try_into().ok()?);
+            Some(format!("{count} elements of {inner}"))
+        }
+        b"SetProperty" | b"MapProperty" => {
+            let removed = u32::from_le_bytes(value.get(..4)?.try_into().ok()?);
+            if removed != 0 {
+                return Some(format!("{inner} ({} bytes)", value.len()));
+            }
+            let count = u32::from_le_bytes(value.get(4..8)?.try_into().ok()?);
+            if let Some(second) = second {
+                Some(format!("{count} entries of {inner} → {second}"))
+            } else {
+                Some(format!("{count} elements of {inner}"))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn fstring(bytes: &[u8], offset: usize) -> io::Result<(&[u8], usize)> {
@@ -119,36 +328,6 @@ pub fn death_stats(bytes: &[u8]) -> io::Result<DeathStats> {
         count,
         play_seconds_at_last_death,
     })
-}
-
-/// Removes serialized death statistics from a companion save, if present.
-pub fn remove_death_stats(bytes: &mut Vec<u8>) -> io::Result<bool> {
-    let mut ranges = Vec::with_capacity(2);
-    if let Some((kind, offset, start)) = find_property(bytes, b"m_DeathCounter")? {
-        if !matches!(kind, b"IntProperty" | b"Int64Property") {
-            return Err(invalid("Unexpected integer property type"));
-        }
-        let expected = if kind == b"IntProperty" { 4 } else { 8 };
-        if sized_value(bytes, offset, 0)?.len() != expected {
-            return Err(invalid("Invalid integer size"));
-        }
-        ranges.push(start..offset + 9 + expected);
-    }
-    if let Some((kind, offset, start)) = find_property(bytes, b"m_TotalPlaytimeAtLastDeath")? {
-        if kind != b"DoubleProperty" {
-            return Err(invalid("Unexpected property type"));
-        }
-        if sized_value(bytes, offset, 0)?.len() != 8 {
-            return Err(invalid("Invalid last death playtime size"));
-        }
-        ranges.push(start..offset + 17);
-    }
-    let changed = !ranges.is_empty();
-    ranges.sort_unstable_by_key(|range| std::cmp::Reverse(range.start));
-    for range in ranges {
-        bytes.drain(range);
-    }
-    Ok(changed)
 }
 
 /// Locates the complete serialized death property without relying on its offset.
@@ -412,6 +591,94 @@ mod tests {
         assert_eq!(details.level, Some(23.0));
         assert_eq!(details.play_seconds, Some(33_000));
         assert_eq!(details.last_save_ticks, Some(638_936_524_260_480_000));
+
+        let properties = inspect_properties(&bytes).unwrap();
+        assert!(
+            properties.iter().any(|property| {
+                property.name == "m_Difficulty" && property.value == "Hardcore"
+            })
+        );
+        assert!(properties.iter().any(|property| {
+            property.name == "m_LastSaveTimeUTC" && property.value == "2025-09-16 20:47:06 UTC"
+        }));
+    }
+
+    #[test]
+    fn inspects_bool_and_collection_summaries() {
+        fn name(bytes: &mut Vec<u8>, value: &str) {
+            bytes.extend_from_slice(&(value.len() as u32 + 1).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(0);
+        }
+
+        fn collection(
+            bytes: &mut Vec<u8>,
+            name_value: &str,
+            kind: &str,
+            types: &[&str],
+            value: &[u8],
+        ) {
+            name(bytes, name_value);
+            name(bytes, kind);
+            bytes.extend_from_slice(&(types.len() as u32).to_le_bytes());
+            for kind in types {
+                name(bytes, kind);
+                bytes.extend_from_slice(&0u32.to_le_bytes());
+            }
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(value);
+        }
+
+        let mut bytes = b"GVAS".to_vec();
+        name(&mut bytes, "m_HideHelmet");
+        name(&mut bytes, "BoolProperty");
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.push(0x10);
+        collection(
+            &mut bytes,
+            "m_DataCategories",
+            "ArrayProperty",
+            &["IntProperty"],
+            &[2, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0],
+        );
+        collection(
+            &mut bytes,
+            "m_SeenGoals",
+            "SetProperty",
+            &["NameProperty"],
+            &[0, 0, 0, 0, 3, 0, 0, 0],
+        );
+        collection(
+            &mut bytes,
+            "m_VariableValues",
+            "MapProperty",
+            &["NameProperty", "IntProperty"],
+            &[0, 0, 0, 0, 4, 0, 0, 0],
+        );
+        let properties = inspect_properties(&bytes).unwrap();
+        assert_eq!(properties[0].value, "true");
+        assert_eq!(properties[1].value, "2 elements of IntProperty");
+        assert_eq!(properties[2].value, "3 elements of NameProperty");
+        assert_eq!(
+            properties[3].value,
+            "4 entries of NameProperty → IntProperty"
+        );
+    }
+
+    #[test]
+    fn inspects_localized_text_source() {
+        let mut value = vec![0; 4];
+        value.push(0);
+        for text in ["TQ2", "mastery.title", "Storm Caller"] {
+            value.extend_from_slice(&(text.len() as i32 + 1).to_le_bytes());
+            value.extend_from_slice(text.as_bytes());
+            value.push(0);
+        }
+        let mut bytes = b"GVAS".to_vec();
+        add_scalar(&mut bytes, "m_MasteryTitle", "TextProperty", &value);
+        let properties = inspect_properties(&bytes).unwrap();
+        assert_eq!(properties[0].value, "Storm Caller");
     }
 
     #[test]
@@ -432,10 +699,6 @@ mod tests {
         let stats = death_stats(&bytes).unwrap();
         assert_eq!(stats.count, Some(2));
         assert_eq!(stats.play_seconds_at_last_death, Some(300.5));
-        assert!(remove_death_stats(&mut bytes).unwrap());
-        let stats = death_stats(&bytes).unwrap();
-        assert_eq!(stats.count, None);
-        assert_eq!(stats.play_seconds_at_last_death, None);
     }
 
     #[test]

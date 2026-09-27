@@ -35,7 +35,7 @@ fn scalar(bytes: &mut Vec<u8>, name: &str, kind: &str, value: &[u8]) {
 }
 
 #[test]
-fn revive_removes_death_statistics_and_backs_up_companions() {
+fn revive_preserves_companion_saves_and_shared_files() {
     let root = std::env::temp_dir().join(format!(
         "tq2-hc-revival-stats-{}-{}",
         std::process::id(),
@@ -65,6 +65,8 @@ fn revive_removes_death_statistics_and_backs_up_companions() {
     scalar(&mut local, "m_Keep", "IntProperty", &21u32.to_le_bytes());
     fs::write(directory.join("Hero_Data_WorldFluff.sav"), &world).unwrap();
     fs::write(directory.join("Hero_Data_PlayerLocal.sav"), &local).unwrap();
+    fs::write(directory.join("Hero_Data_PlayerLocal.bak"), b"map backup").unwrap();
+    fs::write(directory.join("Saving.sav"), b"saving state").unwrap();
 
     let list = Command::new(env!("CARGO_BIN_EXE_tq2-hc-revival"))
         .args(["--save-dir", directory.to_str().unwrap(), "ls"])
@@ -72,6 +74,26 @@ fn revive_removes_death_statistics_and_backs_up_companions() {
         .unwrap();
     assert!(list.status.success());
     assert!(String::from_utf8_lossy(&list.stdout).contains("Hero"));
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_tq2-hc-revival"))
+        .args(["--save-dir", directory.to_str().unwrap(), "inspect", "Hero"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(inspect.status.success());
+    let inspected = String::from_utf8_lossy(&inspect.stdout);
+    assert!(inspected.contains("m_DeathCounter (IntProperty) = 3"));
+    assert!(inspected.contains("m_TotalPlaytimeAtLastDeath (DoubleProperty) = 123.5"));
+
+    let unavailable = Command::new(env!("CARGO_BIN_EXE_tq2-hc-revival"))
+        .args(["--save-dir", directory.to_str().unwrap(), "restore", "Hero"])
+        .output()
+        .unwrap();
+    assert!(!unavailable.status.success());
+    assert_eq!(
+        fs::read(directory.join("Hero_Header.sav")).unwrap(),
+        header("Hero", true)
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_tq2-hc-revival"))
         .args(["--save-dir", directory.to_str().unwrap(), "revive", "Hero"])
@@ -91,34 +113,26 @@ fn revive_removes_death_statistics_and_backs_up_companions() {
         .unwrap()
         .path();
     assert_eq!(
-        fs::read(backup.join("Hero_Data_WorldFluff.sav")).unwrap(),
+        fs::read(backup.join("Hero_Header.sav")).unwrap(),
+        header("Hero", true)
+    );
+    assert!(!backup.join("Hero_Data_WorldFluff.sav").exists());
+    assert!(!backup.join("Hero_Data_PlayerLocal.sav").exists());
+    assert_eq!(
+        fs::read(directory.join("Hero_Data_WorldFluff.sav")).unwrap(),
         world
     );
     assert_eq!(
-        fs::read(backup.join("Hero_Data_PlayerLocal.sav")).unwrap(),
+        fs::read(directory.join("Hero_Data_PlayerLocal.sav")).unwrap(),
         local
     );
-    let mut expected_world = b"GVAS".to_vec();
-    scalar(
-        &mut expected_world,
-        "m_Keep",
-        "IntProperty",
-        &42u32.to_le_bytes(),
-    );
-    let mut expected_local = b"GVAS".to_vec();
-    scalar(
-        &mut expected_local,
-        "m_Keep",
-        "IntProperty",
-        &21u32.to_le_bytes(),
+    assert_eq!(
+        fs::read(directory.join("Hero_Data_PlayerLocal.bak")).unwrap(),
+        b"map backup"
     );
     assert_eq!(
-        fs::read(directory.join("Hero_Data_WorldFluff.sav")).unwrap(),
-        expected_world
-    );
-    assert_eq!(
-        fs::read(directory.join("Hero_Data_PlayerLocal.sav")).unwrap(),
-        expected_local
+        fs::read(directory.join("Saving.sav")).unwrap(),
+        b"saving state"
     );
     let list = Command::new(env!("CARGO_BIN_EXE_tq2-hc-revival"))
         .args(["--save-dir", directory.to_str().unwrap(), "ls"])
@@ -127,15 +141,54 @@ fn revive_removes_death_statistics_and_backs_up_companions() {
         .unwrap();
     assert!(list.status.success());
     let stdout = String::from_utf8_lossy(&list.stdout);
-    assert!(!stdout.contains("0h 00m 00s"));
-    assert!(stdout.lines().any(|line| {
-        line.contains("Hero")
-            && line
-                .split_whitespace()
-                .rev()
-                .take(2)
-                .all(|field| field == "—")
-    }));
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("Hero") && line.contains("3"))
+    );
+    let restore = Command::new(env!("CARGO_BIN_EXE_tq2-hc-revival"))
+        .args(["--save-dir", directory.to_str().unwrap(), "restore", "Hero"])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(
+        fs::read(directory.join("Hero_Header.sav")).unwrap(),
+        header("Hero", true)
+    );
+    assert_eq!(
+        fs::read(directory.join("Hero_Data_WorldFluff.sav")).unwrap(),
+        world
+    );
+    assert_eq!(
+        fs::read(directory.join("Hero_Data_PlayerLocal.sav")).unwrap(),
+        local
+    );
+    assert_eq!(
+        fs::read_dir(root.join("SaveGames.tq2-hc-revival-backups"))
+            .unwrap()
+            .count(),
+        2
+    );
+    let snapshot = fs::read_dir(root.join("SaveGames.tq2-hc-revival-backups"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-restore")
+        })
+        .unwrap();
+    assert_ne!(
+        fs::read(snapshot.join("Hero_Header.sav")).unwrap(),
+        header("Hero", true)
+    );
+    assert!(!snapshot.join("Hero_Data_WorldFluff.sav").exists());
+    assert!(!snapshot.join("Hero_Data_PlayerLocal.sav").exists());
     fs::remove_dir_all(root).unwrap();
 }
 

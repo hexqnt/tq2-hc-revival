@@ -19,6 +19,12 @@ enum Command {
     #[command(alias = "ls")]
     List,
 
+    /// Show a character's statistics and serialized save properties.
+    Inspect { character: String },
+
+    /// Restore a character from the latest revival backup.
+    Restore { character: String },
+
     /// Revive a character by name, or all dead characters with --all.
     Revive {
         #[arg(long, conflicts_with = "character")]
@@ -60,6 +66,33 @@ fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 print_characters(&characters);
             }
+        }
+        Some(Command::Inspect { character }) => {
+            let selected = named_character(&characters, &character)?;
+            print_characters(std::slice::from_ref(selected));
+            for (filename, properties) in storage::inspect(&directory, selected)? {
+                println!("\n{}", filename.cyan().bold());
+                for property in properties {
+                    println!(
+                        "  {} ({}) = {}",
+                        property.name, property.kind, property.value
+                    );
+                }
+            }
+        }
+        Some(Command::Restore { character }) => {
+            let selected = named_character(&characters, &character)?;
+            eprintln!(
+                "{}",
+                "Close Titan Quest 2 and disable Steam Cloud Sync before restoring.".yellow()
+            );
+            let (source, snapshot) = storage::restore(&directory, selected)?;
+            println!(
+                "Restored {} from {}. Previous files are in {}.",
+                selected.name.green(),
+                source.display(),
+                snapshot.display()
+            );
         }
         Some(Command::Revive { character, all }) => {
             if all {
@@ -106,6 +139,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+fn named_character<'a>(
+    characters: &'a [storage::Character],
+    name: &str,
+) -> Result<&'a storage::Character, Box<dyn Error>> {
+    let mut matches = characters.iter().filter(|entry| entry.name == name);
+    let selected = matches.next().ok_or("Character not found")?;
+    if matches.next().is_some() {
+        return Err("Multiple characters have that name".into());
+    }
+    Ok(selected)
 }
 
 fn main() {
