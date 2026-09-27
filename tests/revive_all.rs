@@ -22,6 +22,167 @@ fn header(name: &str, dead: bool) -> Vec<u8> {
     bytes
 }
 
+fn scalar(bytes: &mut Vec<u8>, name: &str, kind: &str, value: &[u8]) {
+    for text in [name, kind] {
+        bytes.extend_from_slice(&(text.len() as u32 + 1).to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(value);
+}
+
+#[test]
+fn revive_removes_death_statistics_and_backs_up_companions() {
+    let root = std::env::temp_dir().join(format!(
+        "tq2-hc-revival-stats-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let directory = root.join("SaveGames");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("Hero_Header.sav"), header("Hero", true)).unwrap();
+    let mut world = b"GVAS".to_vec();
+    scalar(
+        &mut world,
+        "m_DeathCounter",
+        "IntProperty",
+        &3u32.to_le_bytes(),
+    );
+    scalar(&mut world, "m_Keep", "IntProperty", &42u32.to_le_bytes());
+    let mut local = b"GVAS".to_vec();
+    scalar(
+        &mut local,
+        "m_TotalPlaytimeAtLastDeath",
+        "DoubleProperty",
+        &123.5f64.to_le_bytes(),
+    );
+    scalar(&mut local, "m_Keep", "IntProperty", &21u32.to_le_bytes());
+    fs::write(directory.join("Hero_Data_WorldFluff.sav"), &world).unwrap();
+    fs::write(directory.join("Hero_Data_PlayerLocal.sav"), &local).unwrap();
+
+    let list = Command::new(env!("CARGO_BIN_EXE_tq2-hc-revival"))
+        .args(["--save-dir", directory.to_str().unwrap(), "ls"])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    assert!(String::from_utf8_lossy(&list.stdout).contains("Hero"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tq2-hc-revival"))
+        .args(["--save-dir", directory.to_str().unwrap(), "revive", "Hero"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let backup_root = root.join("SaveGames.tq2-hc-revival-backups");
+    let backup = fs::read_dir(backup_root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        fs::read(backup.join("Hero_Data_WorldFluff.sav")).unwrap(),
+        world
+    );
+    assert_eq!(
+        fs::read(backup.join("Hero_Data_PlayerLocal.sav")).unwrap(),
+        local
+    );
+    let mut expected_world = b"GVAS".to_vec();
+    scalar(
+        &mut expected_world,
+        "m_Keep",
+        "IntProperty",
+        &42u32.to_le_bytes(),
+    );
+    let mut expected_local = b"GVAS".to_vec();
+    scalar(
+        &mut expected_local,
+        "m_Keep",
+        "IntProperty",
+        &21u32.to_le_bytes(),
+    );
+    assert_eq!(
+        fs::read(directory.join("Hero_Data_WorldFluff.sav")).unwrap(),
+        expected_world
+    );
+    assert_eq!(
+        fs::read(directory.join("Hero_Data_PlayerLocal.sav")).unwrap(),
+        expected_local
+    );
+    let list = Command::new(env!("CARGO_BIN_EXE_tq2-hc-revival"))
+        .args(["--save-dir", directory.to_str().unwrap(), "ls"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(!stdout.contains("0h 00m 00s"));
+    assert!(stdout.lines().any(|line| {
+        line.contains("Hero")
+            && line
+                .split_whitespace()
+                .rev()
+                .take(2)
+                .all(|field| field == "—")
+    }));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn list_hides_zero_death_statistics_for_already_revived_characters() {
+    let root = std::env::temp_dir().join(format!(
+        "tq2-hc-revival-old-stats-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("Hero_Header.sav"), header("Hero", false)).unwrap();
+    let mut stats = b"GVAS".to_vec();
+    scalar(
+        &mut stats,
+        "m_DeathCounter",
+        "IntProperty",
+        &0u32.to_le_bytes(),
+    );
+    scalar(
+        &mut stats,
+        "m_TotalPlaytimeAtLastDeath",
+        "DoubleProperty",
+        &0f64.to_le_bytes(),
+    );
+    fs::write(root.join("Hero_Data_WorldFluff.sav"), stats).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tq2-hc-revival"))
+        .args(["--save-dir", root.to_str().unwrap(), "ls"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|line| {
+        line.contains("Hero")
+            && line
+                .split_whitespace()
+                .rev()
+                .take(2)
+                .all(|field| field == "—")
+    }));
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn revive_all_only_changes_dead_characters() {
     let root = std::env::temp_dir().join(format!(

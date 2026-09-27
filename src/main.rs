@@ -16,6 +16,7 @@ mod storage;
 #[derive(Subcommand)]
 enum Command {
     /// List all characters and their save statistics.
+    #[command(alias = "ls")]
     List,
 
     /// Revive a character by name, or all dead characters with --all.
@@ -249,11 +250,13 @@ fn print_characters(characters: &[storage::Character]) {
         let deaths = character
             .deaths
             .count
+            .filter(|count| character.is_dead || *count != 0)
             .map_or_else(|| "—".to_owned(), |count| count.to_string());
         let last_death = character
             .deaths
             .play_seconds_at_last_death
             .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .filter(|seconds| character.is_dead || *seconds != 0.0)
             .map(|seconds| format_duration(seconds as u64))
             .unwrap_or_else(|| "—".to_owned());
         let status = if character.is_dead {

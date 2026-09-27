@@ -31,4 +31,4 @@ tq2-hc-revival --save-dir "/path/to/SaveGames" revive Hexen
 
 Interactive mode asks for a path if none is found, or lets you select a directory if several are found. Detection checks `%LOCALAPPDATA%\TQ2\Saved\SaveGames` on Windows, Steam libraries on all platforms, Proton prefixes on Linux, and the usual TQ2, CrossOver, and Whisky locations on macOS.
 
-Before editing a character, the tool moves its original header, SaveGames `.bak` files, and `Saving.sav` into a timestamped backup directory next to SaveGames. `revive --all` creates a separate backup for each character. Other character files and death statistics remain unchanged.
+Before editing a character, the tool moves its original header, modified death-statistics files, SaveGames `.bak` files, and `Saving.sav` into a timestamped backup directory next to SaveGames. Revival removes the death count and playtime at last death from the character's saves. `revive --all` creates a separate backup for each character. Other character files remain unchanged. In `list`, zero death statistics from saves revived by older versions appear as `—`.

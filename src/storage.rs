@@ -25,24 +25,54 @@ pub fn revive(directory: &Path, character: &Character) -> io::Result<PathBuf> {
     let property = save::death_property(&bytes)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Character is no longer dead"))?;
     bytes.drain(property);
-    let cleanup = cleanup_files(directory)?;
-    let backup = create_backup_directory(directory)?;
-    let staged = backup.join("revived-header.tmp");
-    let mut output = File::create_new(&staged)?;
-    output.set_permissions(fs::metadata(&character.path)?.permissions())?;
-    output.write_all(&bytes)?;
-    output.sync_all()?;
-    drop(output);
-
+    let mut edits = vec![(character.path.clone(), bytes)];
     let filename = character
         .path
         .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.strip_suffix("_Header.sav"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid character path"))?;
-    let original = backup.join(filename);
-    fs::rename(&character.path, &original)?;
-    if let Err(error) = fs::rename(&staged, &character.path) {
-        fs::rename(&original, &character.path)?;
-        return Err(error);
+    for suffix in ["_Data_WorldFluff.sav", "_Data_PlayerLocal.sav"] {
+        let path = directory.join(format!("{filename}{suffix}"));
+        match fs::read(&path) {
+            Ok(mut bytes) => {
+                if save::remove_death_stats(&mut bytes)? {
+                    edits.push((path, bytes));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let cleanup = cleanup_files(directory)?;
+    let backup = create_backup_directory(directory)?;
+    let mut staged = Vec::with_capacity(edits.len());
+    for (index, (path, bytes)) in edits.iter().enumerate() {
+        let temporary = backup.join(format!("revived-{index}.tmp"));
+        let mut output = File::create_new(&temporary)?;
+        output.set_permissions(fs::metadata(path)?.permissions())?;
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        staged.push(temporary);
+    }
+    let mut replaced = Vec::with_capacity(edits.len());
+    for ((path, _), temporary) in edits.iter().zip(&staged) {
+        let filename = path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid character path"))?;
+        let original = backup.join(filename);
+        if let Err(error) = fs::rename(path, &original).and_then(|()| {
+            fs::rename(temporary, path).inspect_err(|_| {
+                let _ = fs::rename(&original, path);
+            })
+        }) {
+            for (path, original) in replaced.into_iter().rev() {
+                let _ = fs::remove_file(&path);
+                let _ = fs::rename(original, path);
+            }
+            return Err(error);
+        }
+        replaced.push((path.clone(), original));
     }
     for file in cleanup {
         let filename = file.file_name().ok_or_else(|| {

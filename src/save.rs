@@ -44,7 +44,7 @@ fn invalid(message: &'static str) -> io::Error {
 
 fn property(bytes: &[u8], name: &[u8], kind: &[u8]) -> io::Result<Option<usize>> {
     match find_property(bytes, name)? {
-        Some((actual, offset)) if actual == kind => Ok(Some(offset)),
+        Some((actual, offset, _)) if actual == kind => Ok(Some(offset)),
         Some(_) => Err(invalid("Unexpected property type")),
         None => Ok(None),
     }
@@ -121,6 +121,36 @@ pub fn death_stats(bytes: &[u8]) -> io::Result<DeathStats> {
     })
 }
 
+/// Removes serialized death statistics from a companion save, if present.
+pub fn remove_death_stats(bytes: &mut Vec<u8>) -> io::Result<bool> {
+    let mut ranges = Vec::with_capacity(2);
+    if let Some((kind, offset, start)) = find_property(bytes, b"m_DeathCounter")? {
+        if !matches!(kind, b"IntProperty" | b"Int64Property") {
+            return Err(invalid("Unexpected integer property type"));
+        }
+        let expected = if kind == b"IntProperty" { 4 } else { 8 };
+        if sized_value(bytes, offset, 0)?.len() != expected {
+            return Err(invalid("Invalid integer size"));
+        }
+        ranges.push(start..offset + 9 + expected);
+    }
+    if let Some((kind, offset, start)) = find_property(bytes, b"m_TotalPlaytimeAtLastDeath")? {
+        if kind != b"DoubleProperty" {
+            return Err(invalid("Unexpected property type"));
+        }
+        if sized_value(bytes, offset, 0)?.len() != 8 {
+            return Err(invalid("Invalid last death playtime size"));
+        }
+        ranges.push(start..offset + 17);
+    }
+    let changed = !ranges.is_empty();
+    ranges.sort_unstable_by_key(|range| std::cmp::Reverse(range.start));
+    for range in ranges {
+        bytes.drain(range);
+    }
+    Ok(changed)
+}
+
 /// Locates the complete serialized death property without relying on its offset.
 pub fn death_property(bytes: &[u8]) -> io::Result<Option<Range<usize>>> {
     if !bytes.starts_with(b"GVAS") {
@@ -159,7 +189,7 @@ pub fn death_property(bytes: &[u8]) -> io::Result<Option<Range<usize>>> {
     Ok(found)
 }
 
-fn find_property<'a>(bytes: &'a [u8], name: &[u8]) -> io::Result<Option<(&'a [u8], usize)>> {
+fn find_property<'a>(bytes: &'a [u8], name: &[u8]) -> io::Result<Option<(&'a [u8], usize, usize)>> {
     if !bytes.starts_with(b"GVAS") {
         return Err(invalid("Not an Unreal GVAS save"));
     }
@@ -175,7 +205,7 @@ fn find_property<'a>(bytes: &'a [u8], name: &[u8]) -> io::Result<Option<(&'a [u8
     if matches.next().is_some() {
         return Err(invalid("Multiple matching properties found"));
     }
-    fstring(bytes, start + width).map(Some)
+    fstring(bytes, start + width).map(|(kind, offset)| Some((kind, offset, start)))
 }
 
 pub fn header_details(bytes: &[u8]) -> io::Result<HeaderDetails> {
@@ -272,7 +302,7 @@ pub fn character_name(bytes: &[u8]) -> io::Result<String> {
 }
 
 fn numeric_property(bytes: &[u8], name: &[u8]) -> io::Result<Option<u64>> {
-    let Some((kind, offset)) = find_property(bytes, name)? else {
+    let Some((kind, offset, _)) = find_property(bytes, name)? else {
         return Ok(None);
     };
     let value = sized_value(bytes, offset, 0)?;
@@ -402,6 +432,10 @@ mod tests {
         let stats = death_stats(&bytes).unwrap();
         assert_eq!(stats.count, Some(2));
         assert_eq!(stats.play_seconds_at_last_death, Some(300.5));
+        assert!(remove_death_stats(&mut bytes).unwrap());
+        let stats = death_stats(&bytes).unwrap();
+        assert_eq!(stats.count, None);
+        assert_eq!(stats.play_seconds_at_last_death, None);
     }
 
     #[test]
